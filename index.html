@@ -595,7 +595,7 @@
     <!-- Section 1 -->
     <h2 id="what-is-idempotency">What Is Idempotency and Why Should You Care?</h2>
 
-    <p>An operation is <strong>idempotent</strong> when performing it once produces the same outcome as performing it multiple times. HTTP methods like <code>GET</code>, <code>PUT</code>, and <code>DELETE</code> are idempotent by design. <code>POST</code>, however, is not &mdash; and that is exactly where trouble starts.</p>
+    <p>An operation is <strong>idempotent</strong> when performing it once produces the same outcome as performing it multiple times. HTTP methods like <code>GET</code>, <code>PUT</code> (when used as a full resource replacement), and <code>DELETE</code> are idempotent by design. <code>POST</code>, however, is not &mdash; and that is exactly where trouble starts.</p>
 
     <p>Consider this real-world scenario: a customer submits a payment. The server processes the charge successfully but the response times out before reaching the client. The client retries the exact same request. Without idempotency protection, your application happily processes a second charge.</p>
 
@@ -647,7 +647,7 @@
     <!-- Section 3 -->
     <h2 id="with-idempotency">With Idempotency: Safe, Predictable, Resilient</h2>
 
-    <p>The most widely adopted pattern uses an <strong>idempotency key</strong> &mdash; a unique identifier the client sends with each request. Your server stores the result of the first execution and returns it verbatim for any subsequent requests carrying the same key.</p>
+    <p>The most widely adopted pattern uses an <strong>idempotency key</strong> &mdash; a unique identifier the client sends with each request. Your server locks the key before executing business logic, stores the result of the first execution, and returns it for any subsequent requests carrying the same key.</p>
 
     <h3>Step 1: Define the Idempotency Key Store</h3>
 
@@ -658,7 +658,8 @@
             <div class="code-dots"><span></span><span></span><span></span></div>
             <span class="code-lang">Java &mdash; IdempotencyRecord.java</span>
         </div>
-<pre><code><span class="ann">@Data</span>
+<pre><code><span class="ann">@Getter</span>
+<span class="ann">@Setter</span>
 <span class="ann">@Entity</span>
 <span class="ann">@Table</span>(name = <span class="str">"idempotency_keys"</span>)
 <span class="kw">public class</span> <span class="cls">IdempotencyRecord</span> {
@@ -666,14 +667,23 @@
     <span class="ann">@Id</span>
     <span class="kw">private</span> <span class="cls">String</span> idempotencyKey;
 
+    <span class="ann">@Enumerated</span>(<span class="cls">EnumType</span>.STRING)
+    <span class="kw">private</span> <span class="cls">Status</span> status;
+
     <span class="kw">private int</span> responseStatus;
 
     <span class="ann">@Column</span>(columnDefinition = <span class="str">"TEXT"</span>)
     <span class="kw">private</span> <span class="cls">String</span> responseBody;
 
-    <span class="kw">private</span> <span class="cls">LocalDateTime</span> createdAt;
+    <span class="kw">private</span> <span class="cls">Instant</span> createdAt;
+
+    <span class="kw">public enum</span> <span class="cls">Status</span> {
+        PENDING, COMPLETED
+    }
 }</code></pre>
     </div>
+
+    <p>The <code>status</code> field is the key to preventing race conditions. A <code>PENDING</code> record acts as a lock &mdash; the first request claims the key before any business logic runs. <code>Instant</code> is used instead of <code>LocalDateTime</code> to avoid timezone ambiguity across distributed instances.</p>
 
     <p>Back this with a Spring Data repository:</p>
 
@@ -683,13 +693,15 @@
             <span class="code-lang">Java &mdash; IdempotencyRepository.java</span>
         </div>
 <pre><code><span class="kw">public interface</span> <span class="cls">IdempotencyRepository</span> <span class="kw">extends</span> <span class="cls">JpaRepository</span>&lt;<span class="cls">IdempotencyRecord</span>, <span class="cls">String</span>&gt; {
-    <span class="kw">void</span> <span class="fn">deleteByCreatedAtBefore</span>(<span class="cls">LocalDateTime</span> timestamp);
+    <span class="ann">@Modifying</span>
+    <span class="ann">@Query</span>(<span class="str">"DELETE FROM IdempotencyRecord r WHERE r.createdAt &lt; :timestamp"</span>)
+    <span class="kw">void</span> <span class="fn">deleteByCreatedAtBefore</span>(<span class="ann">@Param</span>(<span class="str">"timestamp"</span>) <span class="cls">Instant</span> timestamp);
 }</code></pre>
     </div>
 
     <h3>Step 2: Build an Idempotency Interceptor</h3>
 
-    <p>Rather than scattering idempotency logic across every controller, centralise it in a servlet filter:</p>
+    <p>Rather than scattering idempotency logic across every controller, centralise it in a servlet filter. The critical detail here is that we <strong>insert a <code>PENDING</code> record before the business logic runs</strong>, so concurrent duplicates are blocked at the database level:</p>
 
     <div class="code-block">
         <div class="code-header">
@@ -717,41 +729,67 @@
             <span class="kw">return</span>;
         }
 
+        <span class="cm">// Check if a completed response already exists for this key</span>
         <span class="cls">Optional</span>&lt;<span class="cls">IdempotencyRecord</span>&gt; existing = repository.<span class="fn">findById</span>(key);
 
         <span class="kw">if</span> (existing.<span class="fn">isPresent</span>()) {
             <span class="cls">IdempotencyRecord</span> record = existing.<span class="fn">get</span>();
+
+            <span class="kw">if</span> (record.<span class="fn">getStatus</span>() == <span class="cls">IdempotencyRecord</span>.<span class="cls">Status</span>.PENDING) {
+                <span class="cm">// Another thread is currently processing this key &mdash; reject the duplicate</span>
+                response.<span class="fn">setStatus</span>(<span class="cls">HttpServletResponse</span>.SC_CONFLICT);
+                response.<span class="fn">setContentType</span>(<span class="str">"application/json"</span>);
+                response.<span class="fn">getWriter</span>().<span class="fn">write</span>(<span class="str">"{\"error\":\"Request is already being processed\"}"</span>);
+                <span class="kw">return</span>;
+            }
+
+            <span class="cm">// Return the cached successful response</span>
             response.<span class="fn">setStatus</span>(record.<span class="fn">getResponseStatus</span>());
             response.<span class="fn">setContentType</span>(<span class="str">"application/json"</span>);
             response.<span class="fn">getWriter</span>().<span class="fn">write</span>(record.<span class="fn">getResponseBody</span>());
             <span class="kw">return</span>;
         }
 
+        <span class="cm">// Claim the key by inserting a PENDING record BEFORE business logic runs</span>
+        <span class="kw">try</span> {
+            <span class="cls">IdempotencyRecord</span> pending = <span class="kw">new</span> <span class="cls">IdempotencyRecord</span>();
+            pending.<span class="fn">setIdempotencyKey</span>(key);
+            pending.<span class="fn">setStatus</span>(<span class="cls">IdempotencyRecord</span>.<span class="cls">Status</span>.PENDING);
+            pending.<span class="fn">setCreatedAt</span>(<span class="cls">Instant</span>.<span class="fn">now</span>());
+            repository.<span class="fn">saveAndFlush</span>(pending);
+        } <span class="kw">catch</span> (<span class="cls">DataIntegrityViolationException</span> e) {
+            <span class="cm">// Another thread claimed this key between our findById and save &mdash; reject</span>
+            response.<span class="fn">setStatus</span>(<span class="cls">HttpServletResponse</span>.SC_CONFLICT);
+            response.<span class="fn">setContentType</span>(<span class="str">"application/json"</span>);
+            response.<span class="fn">getWriter</span>().<span class="fn">write</span>(<span class="str">"{\"error\":\"Duplicate request\"}"</span>);
+            <span class="kw">return</span>;
+        }
+
+        <span class="cm">// Only now execute the business logic &mdash; we hold the lock</span>
         <span class="cls">ContentCachingResponseWrapper</span> wrappedResponse =
                 <span class="kw">new</span> <span class="cls">ContentCachingResponseWrapper</span>(response);
-        chain.<span class="fn">doFilter</span>(request, wrappedResponse);
+        <span class="kw">try</span> {
+            chain.<span class="fn">doFilter</span>(request, wrappedResponse);
+        } <span class="kw">catch</span> (<span class="cls">Exception</span> e) {
+            repository.<span class="fn">deleteById</span>(key); <span class="cm">// Release the lock so the client can retry</span>
+            <span class="kw">throw</span> e;
+        }
 
         <span class="kw">int</span> status = wrappedResponse.<span class="fn">getStatus</span>();
+        <span class="cls">String</span> body = <span class="kw">new</span> <span class="cls">String</span>(wrappedResponse.<span class="fn">getContentAsByteArray</span>(), <span class="cls">StandardCharsets</span>.UTF_8);
 
-        <span class="cm">// Only cache successful or client-error responses — not transient 5xx failures</span>
-        <span class="kw">if</span> (status &lt; <span class="num">500</span>) {
-            <span class="kw">try</span> {
-                <span class="cls">IdempotencyRecord</span> record = <span class="kw">new</span> <span class="cls">IdempotencyRecord</span>();
-                record.<span class="fn">setIdempotencyKey</span>(key);
+        <span class="cm">// Only cache successful responses &mdash; failed requests have no side effects to protect</span>
+        <span class="kw">if</span> (status >= <span class="num">200</span> &amp;&amp; status &lt; <span class="num">300</span>) {
+            <span class="cls">IdempotencyRecord</span> record = repository.<span class="fn">findById</span>(key).<span class="fn">orElse</span>(<span class="kw">null</span>);
+            <span class="kw">if</span> (record != <span class="kw">null</span>) {
+                record.<span class="fn">setStatus</span>(<span class="cls">IdempotencyRecord</span>.<span class="cls">Status</span>.COMPLETED);
                 record.<span class="fn">setResponseStatus</span>(status);
-                record.<span class="fn">setResponseBody</span>(<span class="kw">new</span> <span class="cls">String</span>(wrappedResponse.<span class="fn">getContentAsByteArray</span>()));
-                record.<span class="fn">setCreatedAt</span>(<span class="cls">LocalDateTime</span>.<span class="fn">now</span>());
+                record.<span class="fn">setResponseBody</span>(body);
                 repository.<span class="fn">save</span>(record);
-            } <span class="kw">catch</span> (<span class="cls">DataIntegrityViolationException</span> e) {
-                <span class="cm">// Race condition: another thread saved this key first — return the stored response</span>
-                <span class="cls">IdempotencyRecord</span> saved = repository.<span class="fn">findById</span>(key).<span class="fn">orElse</span>(<span class="kw">null</span>);
-                <span class="kw">if</span> (saved != <span class="kw">null</span>) {
-                    response.<span class="fn">setStatus</span>(saved.<span class="fn">getResponseStatus</span>());
-                    response.<span class="fn">setContentType</span>(<span class="str">"application/json"</span>);
-                    response.<span class="fn">getWriter</span>().<span class="fn">write</span>(saved.<span class="fn">getResponseBody</span>());
-                    <span class="kw">return</span>;
-                }
             }
+        } <span class="kw">else</span> {
+            <span class="cm">// Business logic failed &mdash; remove the PENDING lock so the client can retry</span>
+            repository.<span class="fn">deleteById</span>(key);
         }
 
         wrappedResponse.<span class="fn">copyBodyToResponse</span>();
@@ -759,64 +797,10 @@
 }</code></pre>
     </div>
 
-    <h3>Step 3: Update the Payment Endpoint</h3>
-
-    <p>Your controller stays clean &mdash; the filter handles everything transparently:</p>
-
-    <div class="code-block">
-        <div class="code-header">
-            <div class="code-dots"><span></span><span></span><span></span></div>
-            <span class="code-lang">Java</span>
-        </div>
-<pre><code><span class="ann">@PostMapping</span>(<span class="str">"/payments"</span>)
-<span class="kw">public</span> <span class="cls">ResponseEntity</span>&lt;<span class="cls">PaymentResponse</span>&gt; <span class="fn">createPayment</span>(<span class="ann">@RequestBody</span> <span class="cls">PaymentRequest</span> request) {
-    <span class="cls">Payment</span> payment = paymentService.<span class="fn">processPayment</span>(request);
-    <span class="kw">return</span> <span class="cls">ResponseEntity</span>.<span class="fn">status</span>(<span class="cls">HttpStatus</span>.CREATED).<span class="fn">body</span>(<span class="fn">toResponse</span>(payment));
-}</code></pre>
-    </div>
-
-    <div class="callout callout-success">
-        <span class="callout-icon">&#10004;</span>
-        <div class="callout-content">
-            <p>Now, when a client sends the same <code>Idempotency-Key</code> header twice, the second request returns the cached response instantly. <strong>No duplicate charge. No duplicate database row. No drama.</strong></p>
-        </div>
-    </div>
-
-    <hr>
-
-    <!-- Section 4: Pitfalls -->
-    <h2 id="pitfalls">Common Pitfalls to Watch Out For</h2>
-
-    <p>Even with a solid implementation, several traps await the unwary.</p>
-
-    <div class="pitfall-card">
-        <span class="pitfall-number">1</span>
-        <h3>Race Conditions on Concurrent Retries</h3>
-        <p>If two identical requests arrive simultaneously, both might pass the "does this key exist?" check before either writes the record. <strong>Use a database unique constraint</strong> on the idempotency key column and handle the constraint violation gracefully. Alternatively, use distributed locking with Redis (<code>SETNX</code>) for high-throughput systems.</p>
-    </div>
-
-    <div class="pitfall-card">
-        <span class="pitfall-number">2</span>
-        <h3>Never Expiring Idempotency Keys</h3>
-        <p>Storing keys indefinitely bloats your database. Set a sensible time-to-live &mdash; 24 to 48 hours covers the vast majority of retry windows. Schedule a cleanup job to purge expired records:</p>
-    </div>
-
-    <div class="code-block">
-        <div class="code-header">
-            <div class="code-dots"><span></span><span></span><span></span></div>
-            <span class="code-lang">Java &mdash; Scheduled Cleanup</span>
-        </div>
-<pre><code><span class="ann">@Transactional</span>
-<span class="ann">@Scheduled</span>(cron = <span class="str">"0 0 3 * * *"</span>)
-<span class="kw">public void</span> <span class="fn">purgeExpiredKeys</span>() {
-    repository.<span class="fn">deleteByCreatedAtBefore</span>(<span class="cls">LocalDateTime</span>.<span class="fn">now</span>().<span class="fn">minusHours</span>(<span class="num">48</span>));
-}</code></pre>
-    </div>
-
     <div class="pitfall-card">
         <span class="pitfall-number">3</span>
         <h3>Caching Error Responses</h3>
-        <p>Should you cache a <code>500 Internal Server Error</code>? Generally, <strong>no</strong>. If the server fails, the client should be free to retry and get a successful result. Only cache responses with <code>2xx</code> or <code>4xx</code> status codes &mdash; transient failures deserve a fresh attempt.</p>
+        <p>Should you cache error responses? Generally, <strong>no</strong>. A <code>400 Bad Request</code> means nothing happened &mdash; there is no side effect to protect against. A <code>500 Internal Server Error</code> is transient and the client should be free to retry. Only cache <code>2xx</code> successful responses, where the operation actually executed and a duplicate would cause real harm.</p>
     </div>
 
     <div class="pitfall-card">
@@ -845,7 +829,7 @@
         <li>Any <code>POST</code> endpoint where a retry causes observable duplication</li>
     </ul>
 
-    <p><code>GET</code>, <code>PUT</code>, and <code>DELETE</code> endpoints are naturally idempotent when implemented correctly, so they rarely need additional protection.</p>
+    <p><code>GET</code> and <code>DELETE</code> endpoints are naturally idempotent. <code>PUT</code> is idempotent when implemented as a full resource replacement &mdash; but if your <code>PUT</code> performs partial updates or increments values, consider protecting it too.</p>
 
     <hr>
 
@@ -855,6 +839,7 @@
         <ul class="check-list">
             <li>Idempotency protects your users and your data from the inevitable chaos of distributed systems.</li>
             <li>Use a client-supplied <code>Idempotency-Key</code> header to uniquely identify each operation.</li>
+            <li><strong>Lock the key before executing business logic</strong> &mdash; never after. This is the most common mistake.</li>
             <li>Centralise the logic in a filter or interceptor to keep your controllers clean.</li>
             <li>Guard against race conditions, unbounded storage, cached errors, and payload mismatches.</li>
             <li>Store idempotency records in a shared, persistent store to support horizontal scaling.</li>
@@ -868,7 +853,7 @@
         <h2>Ready to Level Up Your APIs?</h2>
         <p>Idempotency is one of those patterns that separates fragile prototypes from production-grade systems. Start by adding it to your most critical endpoints and expand from there.</p>
         <div class="cta-links">
-            <a href="https://spring.io/projects/spring-cloud-circuitbreaker" class="cta-link" target="_blank" rel="noopener">
+            <a href="https://spring.io/projects/spring-cloud-circuitbreaker/" class="cta-link" target="_blank" rel="noopener">
                 <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M6.354 5.5H4a3 3 0 0 0 0 6h3a3 3 0 0 0 2.83-4H9q-.13 0-.25.031A2 2 0 0 1 7 10H4a2 2 0 1 1 0-4h1.535c.218-.376.495-.714.82-1z"/><path d="M9 5.5a3 3 0 0 0-2.83 4h1.098A2 2 0 0 1 9 6h3a2 2 0 1 1 0 4h-1.535a4 4 0 0 1-.82 1H12a3 3 0 1 0 0-6z"/></svg>
                 Learn about Circuit Breakers
             </a>
