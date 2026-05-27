@@ -658,7 +658,8 @@
             <div class="code-dots"><span></span><span></span><span></span></div>
             <span class="code-lang">Java &mdash; IdempotencyRecord.java</span>
         </div>
-<pre><code><span class="ann">@Entity</span>
+<pre><code><span class="ann">@Data</span>
+<span class="ann">@Entity</span>
 <span class="ann">@Table</span>(name = <span class="str">"idempotency_keys"</span>)
 <span class="kw">public class</span> <span class="cls">IdempotencyRecord</span> {
 
@@ -682,6 +683,7 @@
             <span class="code-lang">Java &mdash; IdempotencyRepository.java</span>
         </div>
 <pre><code><span class="kw">public interface</span> <span class="cls">IdempotencyRepository</span> <span class="kw">extends</span> <span class="cls">JpaRepository</span>&lt;<span class="cls">IdempotencyRecord</span>, <span class="cls">String</span>&gt; {
+    <span class="kw">void</span> <span class="fn">deleteByCreatedAtBefore</span>(<span class="cls">LocalDateTime</span> timestamp);
 }</code></pre>
     </div>
 
@@ -698,11 +700,9 @@
 <span class="kw">public class</span> <span class="cls">IdempotencyFilter</span> <span class="kw">extends</span> <span class="cls">OncePerRequestFilter</span> {
 
     <span class="kw">private final</span> <span class="cls">IdempotencyRepository</span> repository;
-    <span class="kw">private final</span> <span class="cls">ObjectMapper</span> objectMapper;
 
-    <span class="kw">public</span> <span class="fn">IdempotencyFilter</span>(<span class="cls">IdempotencyRepository</span> repository, <span class="cls">ObjectMapper</span> objectMapper) {
+    <span class="kw">public</span> <span class="fn">IdempotencyFilter</span>(<span class="cls">IdempotencyRepository</span> repository) {
         <span class="kw">this</span>.repository = repository;
-        <span class="kw">this</span>.objectMapper = objectMapper;
     }
 
     <span class="ann">@Override</span>
@@ -731,12 +731,28 @@
                 <span class="kw">new</span> <span class="cls">ContentCachingResponseWrapper</span>(response);
         chain.<span class="fn">doFilter</span>(request, wrappedResponse);
 
-        <span class="cls">IdempotencyRecord</span> record = <span class="kw">new</span> <span class="cls">IdempotencyRecord</span>();
-        record.<span class="fn">setIdempotencyKey</span>(key);
-        record.<span class="fn">setResponseStatus</span>(wrappedResponse.<span class="fn">getStatus</span>());
-        record.<span class="fn">setResponseBody</span>(<span class="kw">new</span> <span class="cls">String</span>(wrappedResponse.<span class="fn">getContentAsByteArray</span>()));
-        record.<span class="fn">setCreatedAt</span>(<span class="cls">LocalDateTime</span>.<span class="fn">now</span>());
-        repository.<span class="fn">save</span>(record);
+        <span class="kw">int</span> status = wrappedResponse.<span class="fn">getStatus</span>();
+
+        <span class="cm">// Only cache successful or client-error responses — not transient 5xx failures</span>
+        <span class="kw">if</span> (status &lt; <span class="num">500</span>) {
+            <span class="kw">try</span> {
+                <span class="cls">IdempotencyRecord</span> record = <span class="kw">new</span> <span class="cls">IdempotencyRecord</span>();
+                record.<span class="fn">setIdempotencyKey</span>(key);
+                record.<span class="fn">setResponseStatus</span>(status);
+                record.<span class="fn">setResponseBody</span>(<span class="kw">new</span> <span class="cls">String</span>(wrappedResponse.<span class="fn">getContentAsByteArray</span>()));
+                record.<span class="fn">setCreatedAt</span>(<span class="cls">LocalDateTime</span>.<span class="fn">now</span>());
+                repository.<span class="fn">save</span>(record);
+            } <span class="kw">catch</span> (<span class="cls">DataIntegrityViolationException</span> e) {
+                <span class="cm">// Race condition: another thread saved this key first — return the stored response</span>
+                <span class="cls">IdempotencyRecord</span> saved = repository.<span class="fn">findById</span>(key).<span class="fn">orElse</span>(<span class="kw">null</span>);
+                <span class="kw">if</span> (saved != <span class="kw">null</span>) {
+                    response.<span class="fn">setStatus</span>(saved.<span class="fn">getResponseStatus</span>());
+                    response.<span class="fn">setContentType</span>(<span class="str">"application/json"</span>);
+                    response.<span class="fn">getWriter</span>().<span class="fn">write</span>(saved.<span class="fn">getResponseBody</span>());
+                    <span class="kw">return</span>;
+                }
+            }
+        }
 
         wrappedResponse.<span class="fn">copyBodyToResponse</span>();
     }
@@ -790,7 +806,8 @@
             <div class="code-dots"><span></span><span></span><span></span></div>
             <span class="code-lang">Java &mdash; Scheduled Cleanup</span>
         </div>
-<pre><code><span class="ann">@Scheduled</span>(cron = <span class="str">"0 0 3 * * *"</span>)
+<pre><code><span class="ann">@Transactional</span>
+<span class="ann">@Scheduled</span>(cron = <span class="str">"0 0 3 * * *"</span>)
 <span class="kw">public void</span> <span class="fn">purgeExpiredKeys</span>() {
     repository.<span class="fn">deleteByCreatedAtBefore</span>(<span class="cls">LocalDateTime</span>.<span class="fn">now</span>().<span class="fn">minusHours</span>(<span class="num">48</span>));
 }</code></pre>
@@ -805,7 +822,7 @@
     <div class="pitfall-card">
         <span class="pitfall-number">4</span>
         <h3>Ignoring Request Body Mismatches</h3>
-        <p>A malicious or buggy client might reuse an idempotency key with a different request body. Validate that the incoming payload matches the original. Store a hash of the request body alongside the key and return a <code>422 Unprocessable Entity</code> if they diverge.</p>
+        <p>A malicious or buggy client might reuse an idempotency key with a different request body. Validate that the incoming payload matches the original. Store a hash of the request body alongside the key and return a <code>409 Conflict</code> if they diverge.</p>
     </div>
 
     <div class="pitfall-card">
@@ -855,13 +872,13 @@
                 <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M6.354 5.5H4a3 3 0 0 0 0 6h3a3 3 0 0 0 2.83-4H9q-.13 0-.25.031A2 2 0 0 1 7 10H4a2 2 0 1 1 0-4h1.535c.218-.376.495-.714.82-1z"/><path d="M9 5.5a3 3 0 0 0-2.83 4h1.098A2 2 0 0 1 9 6h3a2 2 0 1 1 0 4h-1.535a4 4 0 0 1-.82 1H12a3 3 0 1 0 0-6z"/></svg>
                 Learn about Circuit Breakers
             </a>
-            <a href="https://docs.spring.io/spring-retry/docs/api/current/" class="cta-link" target="_blank" rel="noopener">
+            <a href="https://github.com/spring-projects/spring-retry" class="cta-link" target="_blank" rel="noopener">
                 <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M11.534 7h3.932a.25.25 0 0 1 .192.41l-1.966 2.36a.25.25 0 0 1-.384 0l-1.966-2.36a.25.25 0 0 1 .192-.41m-11 2h3.932a.25.25 0 0 0 .192-.41L2.692 6.23a.25.25 0 0 0-.384 0L.342 8.59A.25.25 0 0 0 .534 9"/><path d="M8 3c-1.552 0-2.94.707-3.857 1.818a.5.5 0 1 1-.771-.636A6.002 6.002 0 0 1 13.917 7H12.9A5 5 0 0 0 8 3M3.1 9a5.002 5.002 0 0 0 8.757 2.182.5.5 0 1 1 .771.636A6.002 6.002 0 0 1 2.083 9z"/></svg>
                 Explore Retry Patterns
             </a>
-            <a href="https://spring.io/projects/spring-cloud-sleuth" class="cta-link" target="_blank" rel="noopener">
+            <a href="https://docs.micrometer.io/tracing/reference/" class="cta-link" target="_blank" rel="noopener">
                 <svg width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M8 16a2 2 0 0 0 2-2H6a2 2 0 0 0 2 2m.995-14.901a1 1 0 1 0-1.99 0A5 5 0 0 0 3 6c0 1.098-.5 6-2 7h14c-1.5-1-2-5.902-2-7 0-2.42-1.72-4.44-4.005-4.901"/></svg>
-                Discover Distributed Tracing
+                Discover Micrometer Tracing
             </a>
         </div>
     </div>
